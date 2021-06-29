@@ -40,6 +40,7 @@ import io.netty.util.concurrent.EventExecutorGroup;
 import io.seata.common.exception.FrameworkErrorCode;
 import io.seata.common.exception.FrameworkException;
 import io.seata.common.thread.NamedThreadFactory;
+import io.seata.common.util.CollectionUtils;
 import io.seata.common.util.NetUtil;
 import io.seata.common.util.StringUtils;
 import io.seata.core.protocol.AbstractMessage;
@@ -152,13 +153,13 @@ public abstract class AbstractNettyRemotingClient extends AbstractNettyRemoting 
             futures.put(rpcMessage.getId(), messageFuture);
 
             // put message into basketMap
-            ConcurrentHashMap<String, BlockingQueue<RpcMessage>> map = basketMap;
-            BlockingQueue<RpcMessage> basket = map.get(serverAddress);
-            if (basket == null) {
-                map.putIfAbsent(serverAddress, new LinkedBlockingQueue<>());
-                basket = map.get(serverAddress);
+            BlockingQueue<RpcMessage> basket = CollectionUtils.computeIfAbsent(basketMap, serverAddress,
+                key -> new LinkedBlockingQueue<>());
+            if (!basket.offer(rpcMessage)) {
+                LOGGER.error("put message into basketMap offer failed, serverAddress:{},rpcMessage:{}",
+                        serverAddress, rpcMessage);
+                return null;
             }
-            basket.offer(rpcMessage);
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("offer message: {}", rpcMessage.getBody());
             }
@@ -251,12 +252,12 @@ public abstract class AbstractNettyRemotingClient extends AbstractNettyRemoting 
         return clientChannelManager;
     }
 
-    private String loadBalance(String transactionServiceGroup, Object msg) {
+    protected String loadBalance(String transactionServiceGroup, Object msg) {
         InetSocketAddress address = null;
         try {
             @SuppressWarnings("unchecked")
             List<InetSocketAddress> inetSocketAddressList = RegistryFactory.getInstance().lookup(transactionServiceGroup);
-            address = LoadBalanceFactory.getInstance().select(inetSocketAddressList, getXid(msg));
+            address = this.doSelect(inetSocketAddressList, msg);
         } catch (Exception ex) {
             LOGGER.error(ex.getMessage());
         }
@@ -266,7 +267,18 @@ public abstract class AbstractNettyRemotingClient extends AbstractNettyRemoting 
         return NetUtil.toStringAddress(address);
     }
 
-    private String getXid(Object msg) {
+    protected InetSocketAddress doSelect(List<InetSocketAddress> list, Object msg) throws Exception {
+        if (CollectionUtils.isNotEmpty(list)) {
+            if (list.size() > 1) {
+                return LoadBalanceFactory.getInstance().select(list, getXid(msg));
+            } else {
+                return list.get(0);
+            }
+        }
+        return null;
+    }
+
+    protected String getXid(Object msg) {
         String xid = "";
         if (msg instanceof AbstractGlobalEndRequest) {
             xid = ((AbstractGlobalEndRequest) msg).getXid();
@@ -319,10 +331,9 @@ public abstract class AbstractNettyRemotingClient extends AbstractNettyRemoting 
                     }
                 }
                 isSending = true;
-                for (String address : basketMap.keySet()) {
-                    BlockingQueue<RpcMessage> basket = basketMap.get(address);
+                basketMap.forEach((address, basket) -> {
                     if (basket.isEmpty()) {
-                        continue;
+                        return;
                     }
 
                     MergedWarpMessage mergeMessage = new MergedWarpMessage();
@@ -354,7 +365,7 @@ public abstract class AbstractNettyRemotingClient extends AbstractNettyRemoting 
                         }
                         LOGGER.error("client merge call failed: {}", e.getMessage(), e);
                     }
-                }
+                });
                 isSending = false;
             }
         }
